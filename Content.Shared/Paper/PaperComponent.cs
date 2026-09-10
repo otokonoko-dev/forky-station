@@ -95,4 +95,16 @@ public sealed partial class PaperComponent : Component
         Blank,
         Written
     }
+
+    // Funky Station - Book Pagination
+    [Serializable, NetSerializable]
+    public sealed class BookPageChangeMessage : BoundUserInterfaceMessage
+    {
+        public readonly int NewPage;
+
+        public BookPageChangeMessage(int newPage)
+        {
+            NewPage = newPage;
+        }
+    }
 }

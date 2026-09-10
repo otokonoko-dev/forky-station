@@ -3,6 +3,7 @@ using Robust.Client.UserInterface;
 using Robust.Client.UserInterface.Controls;
 using Robust.Shared.Utility;
 using Content.Shared.Paper;
+using Content.Shared._Funkystation.Paper;
 using static Content.Shared.Paper.PaperComponent;
 
 namespace Content.Client.Paper.UI;
@@ -33,12 +34,27 @@ public sealed class PaperBoundUserInterface : BoundUserInterface
         {
             _window.InitVisuals(Owner, visuals);
         }
+
+        // Funky Station - Book Pagination
+        if (EntMan.TryGetComponent<BookPaginationComponent>(Owner, out var pagination))
+        {
+            _window.EnablePagination(pagination.CurrentPage, pagination.LinesPerPage);
+            _window.OnPageChanged += OnPageChanged;
+        }
     }
 
     protected override void UpdateState(BoundUserInterfaceState state)
     {
         base.UpdateState(state);
-        _window?.Populate((PaperBoundUserInterfaceState) state);
+
+        if (state is not PaperBoundUserInterfaceState paperState)
+            return;
+
+        // Funky Station - Book Pagination: pick up the page the server confirmed for us
+        if (EntMan.TryGetComponent<BookPaginationComponent>(Owner, out var pagination))
+            _window?.SetPage(pagination.CurrentPage);
+
+        _window?.Populate(paperState);
     }
 
     private void InputOnTextEntered(string text)
@@ -55,5 +71,11 @@ public sealed class PaperBoundUserInterface : BoundUserInterface
     private void OnSignatureRequested(int signatureIndex)
     {
         SendMessage(new PaperSignatureRequestMessage(signatureIndex));
+    }
+
+    // Funky Station - Book Pagination
+    private void OnPageChanged(int newPage)
+    {
+        SendMessage(new BookPageChangeMessage(newPage));
     }
 }

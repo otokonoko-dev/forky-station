@@ -16,6 +16,12 @@ using Content.Client.UserInterface.RichText;
 using Robust.Shared.Input;
 using Robust.Shared.IoC;
 using Robust.Client.Player;
+using Robust.Client.Audio;
+using Robust.Shared.Audio;
+using Robust.Shared.Audio.Systems;
+using Robust.Shared.Player;
+using System.Linq;
+using System.Text;
 using Content.Shared.Tag;
 using Content.Shared.Hands.EntitySystems;
 using Content.Shared.Popups;
@@ -33,6 +39,10 @@ namespace Content.Client.Paper.UI
         [Dependency] private IEntityManager _entityManager = default!;
 
         private static Color DefaultTextColor = new(25, 25, 25);
+
+        // Funky Station - Book Pagination
+        private static readonly SoundPathSpecifier PageTurnSound = new("/Audio/_Funkystation/Items/Paper/page_turn.ogg");
+        private const int DefaultLinesPerPage = 19;
 
         // Default color for text which hasn't been changed using markup
         private Color _writtenTextColor = DefaultTextColor;
@@ -70,6 +80,15 @@ namespace Content.Client.Paper.UI
 
         public event Action<string>? OnSaved;
         public event Action<int>? OnSignatureRequested;
+
+        // Funky Station - Book Pagination
+        public event Action<int>? OnPageChanged;
+        private bool _isPaginated;
+        private int _currentPage;
+        private int _linesPerPage = DefaultLinesPerPage;
+        private List<string> _pages = new();
+        private Font? _paginationFont;
+        private float _paginationWidth;
 
         private int _MaxInputLength = -1;
         public int MaxInputLength
@@ -119,6 +138,12 @@ namespace Content.Client.Paper.UI
 
             SaveButton.Text = Loc.GetString("paper-ui-save-button",
                 ("keybind", _inputManager.GetKeyFunctionButtonString(EngineKeyFunctions.MultilineTextSubmit)));
+
+            // Funky Station - Book Pagination
+            PrevPageButton.OnPressed += _ => ChangePage(_currentPage - 1);
+            NextPageButton.OnPressed += _ => ChangePage(_currentPage + 1);
+            PrevPageButton.Text = Loc.GetString("book-ui-prev-page");
+            NextPageButton.Text = Loc.GetString("book-ui-next-page");
         }
 
         /// <summary>
@@ -244,6 +269,19 @@ namespace Content.Client.Paper.UI
             {
                 float fontLineHeight = font.GetLineHeight(1.0f);
 
+                // Funky Station - Book Pagination: font and width aren't known until the first
+                // layout pass, and both change when the window is resized. Re-flow when they move.
+                if (_isPaginated)
+                {
+                    var renderWidth = WrittenTextLabel.PixelWidth;
+                    if (!ReferenceEquals(_paginationFont, font) || Math.Abs(_paginationWidth - renderWidth) > 0.5f)
+                    {
+                        _paginationFont = font;
+                        _paginationWidth = renderWidth;
+                        Populate(_currentState);
+                    }
+                }
+
                 // Set the font line height in tag handlers so buttons match text height
                 FormTagHandler.FontLineHeight = fontLineHeight;
                 SignatureTagHandler.FontLineHeight = fontLineHeight;
@@ -286,6 +324,7 @@ namespace Content.Client.Paper.UI
             WrittenTextLabel.Visible = !isEditing;
             WrittenTextContainer.Visible = false;
             BlankPaperIndicator.Visible = !isEditing && state.Text.Length == 0;
+            PaginationControls.Visible = _isPaginated && !isEditing; // Funky Station - Book Pagination
 
             if (isEditing)
             {
@@ -315,14 +354,23 @@ namespace Content.Client.Paper.UI
             SignatureTagHandler.ResetSignatureCounter();
             CheckTagHandler.ResetCheckCounter();
 
+            // Funky Station - Book Pagination
+            var displayText = state.Text;
+            if (_isPaginated)
+            {
+                PaginateContent(state.Text);
+                displayText = _pages[_currentPage];
+                UpdatePageControls();
+            }
+
             // Display text with markup processing (forms, signatures, colors, etc.)
             // The markup system converts [form] and [signature] tags into interactive buttons
             var fm = new FormattedMessage();
-            fm.AddMarkupPermissive(state.Text);
+            fm.AddMarkupPermissive(displayText);
             WrittenTextLabel.SetMessage(fm, _allowedTags, _writtenTextColor);
 
             // Add extra bottom margin based on tag count to prevent cutoff (only in read mode)
-            var tagCount = CountTags(state.Text);
+            var tagCount = CountTags(displayText);
             var extraBottomMargin = tagCount * 3.0f; // 3 pixels per tag for extra height
             PaperContent.Margin = new Thickness(_originalContentMargin.Left, _originalContentMargin.Top,
                 _originalContentMargin.Right, _originalContentMargin.Bottom + extraBottomMargin);
@@ -333,7 +381,173 @@ namespace Content.Client.Paper.UI
             StampDisplay.RemoveStamps();
             foreach (var stamper in state.StampedBy)
                 StampDisplay.AddStamp(new StampWidget { StampInfo = stamper });
+
+            // Funky Station - Book Pagination: stamps belong at the end of the book
+            StampDisplay.Visible = !_isPaginated || _currentPage == _pages.Count - 1;
         }
+
+        #region Funky Station - Book Pagination
+
+        /// Switches this window into paged mode, used for books. The starting page comes from
+        /// the entity's <c>BookPaginationComponent</c> so a book reopens where it was left.
+        public void EnablePagination(int currentPage, int linesPerPage)
+        {
+            _isPaginated = true;
+            _currentPage = Math.Max(0, currentPage);
+            _linesPerPage = linesPerPage > 0 ? linesPerPage : DefaultLinesPerPage;
+
+            ScrollingContents.VerticalExpand = false;
+        }
+
+        public void DisablePagination()
+        {
+            _isPaginated = false;
+            PaginationControls.Visible = false;
+            ScrollingContents.VerticalExpand = true;
+        }
+
+        /// Sets the page shown without asking the server, used when the component state changes.
+        public void SetPage(int page)
+        {
+            _currentPage = Math.Max(0, page);
+        }
+
+        private void PaginateContent(string content)
+        {
+            _pages.Clear();
+
+            if (_linesPerPage <= 0)
+                _linesPerPage = DefaultLinesPerPage;
+
+            if (string.IsNullOrEmpty(content))
+            {
+                _pages.Add("");
+            }
+            else
+            {
+                // Wrap to the width the label actually renders at so a "line" here means a line the reader sees.
+                var lines = WrapToDisplayLines(content);
+                for (var i = 0; i < lines.Count; i += _linesPerPage)
+                    _pages.Add(string.Join("\n", lines.Skip(i).Take(_linesPerPage)));
+            }
+
+            if (_pages.Count == 0)
+                _pages.Add("");
+
+            _currentPage = Math.Clamp(_currentPage, 0, _pages.Count - 1);
+        }
+
+        /// Wraps <paramref name="content"/> to the current render width, treating
+        /// existing newlines as hard breaks. Falls back to one line per paragraph if font metrics
+        /// aren't available yet.
+        private List<string> WrapToDisplayLines(string content)
+        {
+            var lines = new List<string>();
+            var paragraphs = content.Split('\n');
+
+            var maxWidth = _paginationWidth;
+            if (_paginationFont == null || maxWidth <= 0)
+            {
+                lines.AddRange(paragraphs);
+                return lines;
+            }
+
+            var spaceWidth = MeasureVisible(" ", _paginationFont);
+
+            foreach (var paragraph in paragraphs)
+            {
+                if (paragraph.Length == 0)
+                {
+                    lines.Add("");
+                    continue;
+                }
+
+                var line = new StringBuilder();
+                var lineWidth = 0f;
+
+                foreach (var word in paragraph.Split(' '))
+                {
+                    var wordWidth = MeasureVisible(word, _paginationFont);
+                    var separator = line.Length == 0 ? 0f : spaceWidth;
+
+                    if (line.Length > 0 && lineWidth + separator + wordWidth > maxWidth)
+                    {
+                        lines.Add(line.ToString());
+                        line.Clear();
+                        line.Append(word);
+                        lineWidth = wordWidth;
+                        continue;
+                    }
+
+                    if (line.Length > 0)
+                    {
+                        line.Append(' ');
+                        lineWidth += spaceWidth;
+                    }
+
+                    line.Append(word);
+                    lineWidth += wordWidth;
+                }
+
+                lines.Add(line.ToString());
+            }
+
+            return lines;
+        }
+        /// Width of the glyphs a reader actually sees - markup tags take up
+        /// no space once rendered, so they're skipped.
+        private float MeasureVisible(string text, Font font)
+        {
+            var width = 0f;
+            var inTag = false;
+
+            foreach (var rune in text.EnumerateRunes())
+            {
+                if (!inTag && rune.Value == '[')
+                {
+                    inTag = true;
+                    continue;
+                }
+
+                if (inTag)
+                {
+                    if (rune.Value == ']')
+                        inTag = false;
+                    continue;
+                }
+
+                if (font.TryGetCharMetrics(rune, UIScale, out var metrics))
+                    width += metrics.Advance;
+            }
+
+            return width;
+        }
+
+        private void UpdatePageControls()
+        {
+            PrevPageButton.Disabled = _currentPage <= 0;
+            NextPageButton.Disabled = _currentPage >= _pages.Count - 1;
+            PageIndicator.Text = Loc.GetString("book-ui-page-indicator",
+                ("current", _currentPage + 1),
+                ("total", _pages.Count));
+        }
+
+        private void ChangePage(int newPage)
+        {
+            if (!_isPaginated || newPage < 0 || newPage >= _pages.Count || newPage == _currentPage)
+                return;
+
+            _currentPage = newPage;
+
+            // Re-run the normal populate path so forms, signatures and stamps are rebuilt
+            // exactly the way they are for an unpaginated page.
+            Populate(_currentState);
+
+            OnPageChanged?.Invoke(newPage);
+            _entityManager.System<AudioSystem>().PlayGlobal(PageTurnSound, Filter.Local(), false);
+        }
+
+        #endregion
 
         /// <summary>
         /// Base Window. Determines how the window can be dragged/resized based on mouse position (Like FancyWindow).
